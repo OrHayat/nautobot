@@ -1,3 +1,4 @@
+from django.db import connections, InterfaceError, OperationalError, router
 from django_celery_results.backends import DatabaseBackend
 
 from nautobot.core.utils.logging import sanitize
@@ -19,6 +20,27 @@ class NautobotDatabaseBackend(DatabaseBackend):
     def decode_content(self, obj, content):
         """Pass through decoding since we're storing as JSON explicitly."""
         return content
+
+    def _store_result(self, task_id, result, status, traceback=None, request=None, using=None):
+        """
+        Overload default to recover a database connection that was closed while idle.
+
+        The worker's main process stores the result of a lost or revoked task itself, outside any request or task,
+        so nothing else refreshes its connection: it ignores CONN_MAX_AGE and stays dead after an error.
+        """
+        conn = connections[using or router.db_for_write(self.TaskModel)]
+        try:
+            if not conn.in_atomic_block:
+                conn.close_if_unusable_or_obsolete()
+            return super()._store_result(task_id, result, status, traceback=traceback, request=request, using=using)
+        # A connection closed by the server or a proxy passes the check above until it is used.
+        except (InterfaceError, OperationalError):
+            if conn.in_atomic_block:
+                raise
+            # Explicitly clear the connection socket due to MySQL not playing nicely with conn.close()
+            conn.connection = None
+            conn.ensure_connection()
+            return super()._store_result(task_id, result, status, traceback=traceback, request=request, using=using)
 
     def _get_extended_properties(self, request, traceback):
         """

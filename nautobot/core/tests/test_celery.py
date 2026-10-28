@@ -1,9 +1,15 @@
 import json
+import time
 from uuid import uuid4
 
+from django.db import connections
+
 from nautobot.core import celery
-from nautobot.core.testing import TestCase
+from nautobot.core.celery.backends import NautobotDatabaseBackend
+from nautobot.core.testing import TestCase, TransactionTestCase
 from nautobot.dcim.models import Device
+from nautobot.extras.choices import JobResultStatusChoices
+from nautobot.extras.models import JobResult
 
 
 class CeleryTest(TestCase):
@@ -55,3 +61,27 @@ class CeleryTest(TestCase):
                     ensure_ascii=False,
                 )
             )
+
+
+class NautobotDatabaseBackendTest(TransactionTestCase):
+    """The worker's main process must be able to store a result on an idle-closed connection."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend = NautobotDatabaseBackend(app=celery.app)
+        self.conn = connections["default"]
+        self.conn.ensure_connection()
+
+    def test_store_result_recovers_closed_connection(self):
+        """A connection closed under Django, as by the server or a proxy, is reopened and the result stored."""
+        self.conn.connection.close()
+        task_id = uuid4()
+        self.backend.store_result(task_id, None, JobResultStatusChoices.STATUS_SUCCESS)
+        self.assertEqual(JobResult.objects.get(id=task_id).status, JobResultStatusChoices.STATUS_SUCCESS)
+
+    def test_store_result_honors_conn_max_age(self):
+        """A connection past CONN_MAX_AGE is replaced before the result is stored."""
+        self.conn.close_at = time.monotonic() - 1
+        old_connection = self.conn.connection
+        self.backend.store_result(uuid4(), None, JobResultStatusChoices.STATUS_SUCCESS)
+        self.assertIsNot(self.conn.connection, old_connection)
